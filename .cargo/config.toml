@@ -1,0 +1,8 @@
+[build]
+# Fail on any warnings during CI-like builds
+# rustflags = ["-D", "warnings"]
+
+[alias]
+# Useful shortcuts
+cov     = "llvm-cov nextest --all-features --lcov --output-path lcov.info"
+lint    = "clippy --all-targets --all-features --tests --benches -- -D warnings"
