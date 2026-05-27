@@ -143,19 +143,36 @@ impl OrderService {
     }
 
     fn update_position(&mut self, instrument: &str, side: Side, qty: Decimal, price: Decimal) {
-        if let Some(pos) = self.positions.get_mut(instrument) {
+        let reversal_qty = if let Some(pos) = self.positions.get_mut(instrument) {
             if pos.side == side {
                 pos.add(qty, price);
+                return;
+            }
+            // Opposite side: reduce existing position and capture how much exceeded it
+            let original_qty = pos.quantity;
+            let pnl = pos.reduce(qty, price);
+            self.account.apply_realized_pnl(pnl);
+            if pos.is_flat() {
+                // qty may have exceeded the original position size
+                Some(qty - original_qty)
             } else {
-                let pnl = pos.reduce(qty, price);
-                self.account.apply_realized_pnl(pnl);
-                if pos.is_flat() {
-                    self.positions.remove(instrument);
-                }
+                None
             }
         } else {
             self.positions
                 .insert(instrument.into(), Position::new(instrument.into(), side, qty, price));
+            return;
+        };
+
+        if let Some(remaining) = reversal_qty {
+            self.positions.remove(instrument);
+            if remaining > Decimal::ZERO {
+                // Open a new position in the opposite direction with the excess quantity
+                self.positions.insert(
+                    instrument.into(),
+                    Position::new(instrument.into(), side, remaining, price),
+                );
+            }
         }
     }
 
@@ -321,6 +338,41 @@ mod tests {
         let order = svc.get_order(&id).unwrap();
         assert_eq!(order.status, OrderStatus::Filled);
         assert_eq!(svc.get_account().locked_margin, Decimal::ZERO);
+    }
+
+    #[test]
+    fn position_reversal_excess_creates_opposite_position() {
+        let mut svc = setup();
+
+        // Open 1 BTC long
+        let id1 = svc
+            .submit_order(NewOrderRequest {
+                instrument: "BTC/USD".into(),
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                quantity: dec!(1.0),
+                time_in_force: TimeInForce::GTC,
+            })
+            .unwrap();
+        svc.fill_order(&id1, dec!(1.0), dec!(65000)).unwrap();
+        assert_eq!(svc.get_positions().len(), 1);
+
+        // Sell 2 BTC (reversal: 1 closes long, 1 opens short)
+        let id2 = svc
+            .submit_order(NewOrderRequest {
+                instrument: "BTC/USD".into(),
+                side: Side::Sell,
+                order_type: OrderType::Market,
+                quantity: dec!(2.0),
+                time_in_force: TimeInForce::GTC,
+            })
+            .unwrap();
+        svc.fill_order(&id2, dec!(2.0), dec!(67000)).unwrap();
+
+        let positions = svc.get_positions();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].side, Side::Sell);
+        assert_eq!(positions[0].quantity, dec!(1.0));
     }
 
     #[test]

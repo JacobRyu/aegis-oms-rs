@@ -51,6 +51,9 @@ impl Account {
 
     /// 証拠金ロック解除 (キャンセル・約定時)
     pub fn unlock_margin(&mut self, amount: Decimal) -> Result<()> {
+        if amount <= Decimal::ZERO {
+            return Err(OmsError::InvalidMarginAmount { amount });
+        }
         if amount > self.locked_margin {
             return Err(OmsError::MarginUnlockExceeded {
                 unlock_amount: amount,
@@ -85,8 +88,18 @@ pub struct MarginCalculator;
 
 impl MarginCalculator {
     /// 必要証拠金 = (price × quantity) / leverage
-    pub fn required_margin(price: Decimal, quantity: Decimal, leverage: Decimal) -> Decimal {
-        (price * quantity) / leverage
+    pub fn required_margin(
+        price: Decimal,
+        quantity: Decimal,
+        leverage: Decimal,
+    ) -> Result<Decimal> {
+        if leverage <= Decimal::ZERO {
+            return Err(OmsError::RiskCheckFailed { reason: "Leverage must be positive".into() });
+        }
+        let notional = price.checked_mul(quantity).ok_or_else(|| OmsError::RiskCheckFailed {
+            reason: "Margin calculation overflow".into(),
+        })?;
+        Ok(notional / leverage)
     }
 }
 
@@ -137,6 +150,22 @@ mod tests {
     }
 
     #[test]
+    fn unlock_margin_zero_rejected() {
+        let mut acc = test_account();
+        acc.lock_margin(dec!(5000)).unwrap();
+        assert!(acc.unlock_margin(Decimal::ZERO).is_err());
+    }
+
+    #[test]
+    fn unlock_margin_negative_rejected() {
+        let mut acc = test_account();
+        acc.lock_margin(dec!(5000)).unwrap();
+        assert!(acc.unlock_margin(dec!(-1000)).is_err());
+        // negative amount must not inflate locked_margin
+        assert_eq!(acc.locked_margin, dec!(5000));
+    }
+
+    #[test]
     fn unlock_margin_success() {
         let mut acc = test_account();
         acc.lock_margin(dec!(10000)).unwrap();
@@ -169,15 +198,25 @@ mod tests {
     #[test]
     fn margin_calculator_required_margin() {
         // BTC/USD: price=65000, qty=1.0, leverage=2x → margin=32500
-        let margin = MarginCalculator::required_margin(dec!(65000), dec!(1.0), dec!(2));
+        let margin = MarginCalculator::required_margin(dec!(65000), dec!(1.0), dec!(2)).unwrap();
         assert_eq!(margin, dec!(32500));
     }
 
     #[test]
     fn margin_calculator_fx_leverage() {
         // USD/JPY: price=150, qty=10000, leverage=25x → margin=60000
-        let margin = MarginCalculator::required_margin(dec!(150), dec!(10000), dec!(25));
+        let margin = MarginCalculator::required_margin(dec!(150), dec!(10000), dec!(25)).unwrap();
         assert_eq!(margin, dec!(60000));
+    }
+
+    #[test]
+    fn margin_calculator_zero_leverage_rejected() {
+        assert!(MarginCalculator::required_margin(dec!(65000), dec!(1), Decimal::ZERO).is_err());
+    }
+
+    #[test]
+    fn margin_calculator_negative_leverage_rejected() {
+        assert!(MarginCalculator::required_margin(dec!(65000), dec!(1), dec!(-1)).is_err());
     }
 
     #[test]

@@ -69,7 +69,7 @@ impl RiskChecker {
         quantity: Decimal,
         leverage: Decimal,
     ) -> Result<Decimal> {
-        let required = MarginCalculator::required_margin(price, quantity, leverage);
+        let required = MarginCalculator::required_margin(price, quantity, leverage)?;
         if available_balance < required {
             return Err(OmsError::InsufficientFunds { required, available: available_balance });
         }
@@ -132,6 +132,13 @@ mod tests {
     fn open_order_limit_reached() {
         let c = checker();
         let result = c.validate_order(&OrderType::Market, dec!(10), 10);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn margin_check_zero_leverage_rejected() {
+        let c = checker();
+        let result = c.validate_margin(dec!(100000), dec!(65000), dec!(1), Decimal::ZERO);
         assert!(result.is_err());
     }
 
