@@ -7,11 +7,20 @@ use crate::domain::order::OrderType;
 pub struct RiskLimits {
     pub max_order_quantity: Decimal,
     pub max_open_orders: usize,
+    /// ロスカット発動水準（証拠金率 %）。デフォルト 50%
+    pub stop_out_ratio: Decimal,
+    /// 追証アラート発動水準（証拠金率 %）。デフォルト 100%
+    pub margin_call_ratio: Decimal,
 }
 
 impl Default for RiskLimits {
     fn default() -> Self {
-        Self { max_order_quantity: Decimal::new(1_000_000, 0), max_open_orders: 100 }
+        Self {
+            max_order_quantity: Decimal::new(1_000_000, 0),
+            max_open_orders: 100,
+            stop_out_ratio: Decimal::new(50, 0),
+            margin_call_ratio: Decimal::new(100, 0),
+        }
     }
 }
 
@@ -52,6 +61,30 @@ impl RiskChecker {
             });
         }
 
+        if let OrderType::Stop { trigger_price } = order_type
+            && *trigger_price <= Decimal::ZERO
+        {
+            return Err(OmsError::RiskCheckFailed {
+                reason: "Stop trigger price must be positive".into(),
+            });
+        }
+
+        if let OrderType::StopLimit { trigger_price, limit_price } = order_type
+            && (*trigger_price <= Decimal::ZERO || *limit_price <= Decimal::ZERO)
+        {
+            return Err(OmsError::RiskCheckFailed {
+                reason: "StopLimit prices must be positive".into(),
+            });
+        }
+
+        if let OrderType::TrailingStop { trail_amount } = order_type
+            && *trail_amount <= Decimal::ZERO
+        {
+            return Err(OmsError::RiskCheckFailed {
+                reason: "TrailingStop trail_amount must be positive".into(),
+            });
+        }
+
         if open_order_count >= self.limits.max_open_orders {
             return Err(OmsError::RiskCheckFailed {
                 reason: format!("Open order limit reached ({})", self.limits.max_open_orders),
@@ -83,7 +116,12 @@ mod tests {
     use rust_decimal_macros::dec;
 
     fn checker() -> RiskChecker {
-        RiskChecker::new(RiskLimits { max_order_quantity: dec!(1000), max_open_orders: 10 })
+        RiskChecker::new(RiskLimits {
+            max_order_quantity: dec!(1000),
+            max_open_orders: 10,
+            stop_out_ratio: dec!(50),
+            margin_call_ratio: dec!(100),
+        })
     }
 
     #[test]

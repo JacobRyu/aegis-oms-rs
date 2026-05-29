@@ -30,4 +30,10 @@ pub enum OmsError {
 
     #[error("Instrument not found: {symbol}")]
     InstrumentNotFound { symbol: String },
+
+    #[error("Composite order not found: {id}")]
+    CompositeOrderNotFound { id: String },
+
+    #[error("Alert send failed: {reason}")]
+    AlertFailed { reason: String },
 }

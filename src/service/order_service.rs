@@ -8,12 +8,14 @@ use crate::domain::event::OrderEvent;
 use crate::domain::instrument::Instrument;
 use crate::domain::order::*;
 use crate::domain::position::Position;
+use crate::domain::trade::Trade;
 use crate::infra::event_bus::EventBus;
 use crate::infra::order_store::{InMemoryOrderStore, OrderStore};
+use crate::infra::trade_store::InMemoryTradeStore;
 use crate::service::risk_check::RiskChecker;
 
 /// 注文作成リクエスト
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NewOrderRequest {
     pub instrument: String,
     pub side: Side,
@@ -31,7 +33,8 @@ pub struct OrderService {
     /// order_id → ロック済み証拠金額
     margin_locks: HashMap<OrderId, Decimal>,
     risk_checker: RiskChecker,
-    event_bus: EventBus,
+    pub event_bus: EventBus,
+    trade_store: InMemoryTradeStore,
 }
 
 impl OrderService {
@@ -51,6 +54,7 @@ impl OrderService {
             margin_locks: HashMap::new(),
             risk_checker,
             event_bus,
+            trade_store: InMemoryTradeStore::new(),
         }
     }
 
@@ -66,16 +70,17 @@ impl OrderService {
         let open_count = self.store.find_open_orders().len();
         self.risk_checker.validate_order(&req.order_type, req.quantity, open_count)?;
 
-        // 必要証拠金の計算 (Market注文は price=0 なので別途考慮が必要だが、MINI版では Limit のみ証拠金チェック)
+        // 必要証拠金の計算と証拠金ロック
         let price = match req.order_type {
             OrderType::Limit { price } => price,
-            OrderType::Market => Decimal::ZERO, // Market注文は実行時に価格決定
+            // Market / Stop 系は提出時に価格不明のためスキップ（約定時に検証）
+            _ => Decimal::ZERO,
         };
 
         let mut order =
             Order::new(req.instrument, req.side, req.order_type, req.quantity, req.time_in_force);
 
-        // 証拠金チェック & ロック (price > 0 の場合のみ)
+        // 証拠金チェック & ロック (Limit 注文のみ)
         if price > Decimal::ZERO {
             let required_margin = self.risk_checker.validate_margin(
                 self.account.available_balance(),
@@ -87,11 +92,20 @@ impl OrderService {
             self.margin_locks.insert(order.id, required_margin);
         }
 
-        order.accept()?;
+        // Stop 系注文は PendingTrigger、それ以外は Accepted へ
+        if order.is_stop_type() {
+            order.pending_trigger()?;
+        } else {
+            order.accept()?;
+        }
 
         let order_id = order.id;
-        self.event_bus.publish(&OrderEvent::Accepted { order_id });
+        let is_stop = order.is_stop_type();
         self.store.save(order)?;
+
+        if !is_stop {
+            self.event_bus.publish(&OrderEvent::Accepted { order_id });
+        }
 
         Ok(order_id)
     }
@@ -122,6 +136,8 @@ impl OrderService {
         let is_fully_filled = order.status == OrderStatus::Filled;
         let instrument = order.instrument.clone();
         let side = order.side;
+        let is_market_order = matches!(order.order_type, OrderType::Market)
+            || matches!(order.order_type, OrderType::Stop { .. } | OrderType::TrailingStop { .. });
 
         // イベント発行
         let event = if is_fully_filled {
@@ -131,49 +147,68 @@ impl OrderService {
         };
         self.event_bus.publish(&event);
 
-        // 証拠金: 完全約定時にロック解除
+        // Market注文は提出時に証拠金をスキップするため、約定時に証拠金を検証する
+        if is_market_order {
+            let leverage = self
+                .instruments
+                .get(&instrument)
+                .ok_or_else(|| OmsError::InstrumentNotFound { symbol: instrument.clone() })?
+                .leverage;
+            self.risk_checker.validate_margin(
+                self.account.available_balance(),
+                price,
+                qty,
+                leverage,
+            )?;
+        }
+
+        // 証拠金: 完全約定時にロック解除 (Limit注文)
         if is_fully_filled && let Some(margin) = self.margin_locks.remove(id) {
             self.account.unlock_margin(margin)?;
         }
 
-        // ポジション更新
-        self.update_position(&instrument, side, qty, price);
+        // ポジション更新して実現損益を取得
+        let realized_pnl = self.update_position_with_pnl(&instrument, side, qty, price);
+
+        // 約定履歴を記録
+        let trade = Trade::new(*id, instrument.clone(), side, qty, price, realized_pnl);
+        self.trade_store.save(trade);
 
         Ok(())
     }
 
-    fn update_position(&mut self, instrument: &str, side: Side, qty: Decimal, price: Decimal) {
-        let reversal_qty = if let Some(pos) = self.positions.get_mut(instrument) {
+    fn update_position_with_pnl(
+        &mut self,
+        instrument: &str,
+        side: Side,
+        qty: Decimal,
+        price: Decimal,
+    ) -> Option<Decimal> {
+        let (reversal_qty, pnl) = if let Some(pos) = self.positions.get_mut(instrument) {
             if pos.side == side {
                 pos.add(qty, price);
-                return;
+                return None;
             }
-            // Opposite side: reduce existing position and capture how much exceeded it
             let original_qty = pos.quantity;
             let pnl = pos.reduce(qty, price);
             self.account.apply_realized_pnl(pnl);
-            if pos.is_flat() {
-                // qty may have exceeded the original position size
-                Some(qty - original_qty)
-            } else {
-                None
-            }
+            if pos.is_flat() { (Some(qty - original_qty), Some(pnl)) } else { (None, Some(pnl)) }
         } else {
             self.positions
                 .insert(instrument.into(), Position::new(instrument.into(), side, qty, price));
-            return;
+            return None;
         };
 
         if let Some(remaining) = reversal_qty {
             self.positions.remove(instrument);
             if remaining > Decimal::ZERO {
-                // Open a new position in the opposite direction with the excess quantity
                 self.positions.insert(
                     instrument.into(),
                     Position::new(instrument.into(), side, remaining, price),
                 );
             }
         }
+        pnl
     }
 
     pub fn get_order(&self, id: &OrderId) -> Option<&Order> {
@@ -190,6 +225,29 @@ impl OrderService {
 
     pub fn get_account(&self) -> &Account {
         &self.account
+    }
+
+    /// 全ポジションの未実現損益を市場価格で更新する
+    ///
+    /// `mark_prices` は銘柄シンボル → 現在市場価格のマップ。
+    /// 呼び出し元が最新の市場価格を提供することで `Position::unrealized_pnl` が更新される。
+    pub fn update_positions_pnl(
+        &mut self,
+        mark_prices: &std::collections::HashMap<String, Decimal>,
+    ) {
+        for (symbol, pos) in &mut self.positions {
+            if let Some(&mark_price) = mark_prices.get(symbol) {
+                pos.update_unrealized_pnl(mark_price);
+            }
+        }
+    }
+
+    /// 約定履歴を取得する
+    pub fn get_trade_history(&self, instrument: Option<&str>) -> Vec<&Trade> {
+        match instrument {
+            Some(sym) => self.trade_store.by_instrument(sym),
+            None => self.trade_store.all(),
+        }
     }
 }
 
@@ -429,5 +487,43 @@ mod tests {
 
         svc.fill_order(&id, dec!(10000), dec!(150)).unwrap();
         assert_eq!(svc.get_account().locked_margin, Decimal::ZERO);
+    }
+
+    #[test]
+    fn market_order_fill_rejected_when_insufficient_margin() {
+        let mut svc = setup();
+        // BTC/USD leverage=2x: 5 BTC @ 65000 requires 162,500 margin, only 100,000 available
+        let id = svc
+            .submit_order(NewOrderRequest {
+                instrument: "BTC/USD".into(),
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                quantity: dec!(5.0),
+                time_in_force: TimeInForce::GTC,
+            })
+            .unwrap();
+        let result = svc.fill_order(&id, dec!(5.0), dec!(65000));
+        assert!(result.is_err(), "Market order fill should fail when margin is insufficient");
+    }
+
+    #[test]
+    fn update_positions_pnl() {
+        let mut svc = setup();
+        let id = svc
+            .submit_order(NewOrderRequest {
+                instrument: "BTC/USD".into(),
+                side: Side::Buy,
+                order_type: OrderType::Limit { price: dec!(65000) },
+                quantity: dec!(1.0),
+                time_in_force: TimeInForce::GTC,
+            })
+            .unwrap();
+        svc.fill_order(&id, dec!(1.0), dec!(65000)).unwrap();
+
+        let mark_prices = [("BTC/USD".to_string(), dec!(67000))].into_iter().collect();
+        svc.update_positions_pnl(&mark_prices);
+
+        let pos = svc.get_positions().into_iter().find(|p| p.instrument == "BTC/USD").unwrap();
+        assert_eq!(pos.unrealized_pnl, dec!(2000));
     }
 }

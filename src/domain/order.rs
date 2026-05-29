@@ -44,7 +44,22 @@ impl std::fmt::Display for Side {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderType {
     Market,
-    Limit { price: Decimal },
+    Limit {
+        price: Decimal,
+    },
+    /// 逆指値: trigger_price に達したら Market として執行
+    Stop {
+        trigger_price: Decimal,
+    },
+    /// 逆指値指値: trigger_price に達したら Limit { limit_price } として発注
+    StopLimit {
+        trigger_price: Decimal,
+        limit_price: Decimal,
+    },
+    /// トレーリングストップ: best_price から trail_amount 離れたら Market として執行
+    TrailingStop {
+        trail_amount: Decimal,
+    },
 }
 
 impl std::fmt::Display for OrderType {
@@ -52,6 +67,11 @@ impl std::fmt::Display for OrderType {
         match self {
             OrderType::Market => write!(f, "Market"),
             OrderType::Limit { price } => write!(f, "Limit@{price}"),
+            OrderType::Stop { trigger_price } => write!(f, "Stop@{trigger_price}"),
+            OrderType::StopLimit { trigger_price, limit_price } => {
+                write!(f, "StopLimit@{trigger_price}/{limit_price}")
+            }
+            OrderType::TrailingStop { trail_amount } => write!(f, "TrailingStop({trail_amount})"),
         }
     }
 }
@@ -69,6 +89,8 @@ pub enum TimeInForce {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderStatus {
     New,
+    /// Stop / StopLimit / TrailingStop 注文がトリガー待ち状態
+    PendingTrigger,
     Accepted,
     PartiallyFilled,
     Filled,
@@ -78,7 +100,13 @@ pub enum OrderStatus {
 
 impl OrderStatus {
     pub fn is_open(&self) -> bool {
-        matches!(self, OrderStatus::New | OrderStatus::Accepted | OrderStatus::PartiallyFilled)
+        matches!(
+            self,
+            OrderStatus::New
+                | OrderStatus::PendingTrigger
+                | OrderStatus::Accepted
+                | OrderStatus::PartiallyFilled
+        )
     }
 
     pub fn is_terminal(&self) -> bool {
@@ -89,8 +117,11 @@ impl OrderStatus {
     pub fn can_transition_to(&self, next: OrderStatus) -> bool {
         matches!(
             (self, next),
-            (OrderStatus::New, OrderStatus::Accepted)
+            (OrderStatus::New, OrderStatus::PendingTrigger)
+                | (OrderStatus::New, OrderStatus::Accepted)
                 | (OrderStatus::New, OrderStatus::Rejected)
+                | (OrderStatus::PendingTrigger, OrderStatus::Accepted)
+                | (OrderStatus::PendingTrigger, OrderStatus::Cancelled)
                 | (OrderStatus::Accepted, OrderStatus::PartiallyFilled)
                 | (OrderStatus::Accepted, OrderStatus::Filled)
                 | (OrderStatus::Accepted, OrderStatus::Cancelled)
@@ -105,6 +136,7 @@ impl std::fmt::Display for OrderStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             OrderStatus::New => "New",
+            OrderStatus::PendingTrigger => "PendingTrigger",
             OrderStatus::Accepted => "Accepted",
             OrderStatus::PartiallyFilled => "PartiallyFilled",
             OrderStatus::Filled => "Filled",
@@ -127,6 +159,8 @@ pub struct Order {
     pub status: OrderStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// TrailingStop 注文が追従する最良価格（その他注文では None）
+    pub best_price: Option<Decimal>,
 }
 
 impl Order {
@@ -149,6 +183,7 @@ impl Order {
             status: OrderStatus::New,
             created_at: now,
             updated_at: now,
+            best_price: None,
         }
     }
 
@@ -204,12 +239,84 @@ impl Order {
         self.transition_to(OrderStatus::Rejected)
     }
 
+    /// Stop / StopLimit / TrailingStop 注文を PendingTrigger 状態へ遷移させる
+    pub fn pending_trigger(&mut self) -> Result<()> {
+        self.transition_to(OrderStatus::PendingTrigger)
+    }
+
+    /// Stop / TrailingStop 注文のトリガー条件を評価し、
+    /// トリガーされた場合は Accepted へ遷移して対応する OrderType を返す。
+    ///
+    /// 返り値:
+    /// - `Some(OrderType::Market)` — Market として即時執行すべき
+    /// - `Some(OrderType::Limit{..})` — StopLimit の Limit 注文として発注すべき
+    /// - `None` — トリガー未達
+    pub fn check_trigger(&mut self, market_price: Decimal) -> Result<Option<OrderType>> {
+        if self.status != OrderStatus::PendingTrigger {
+            return Ok(None);
+        }
+        let triggered = match self.order_type {
+            OrderType::Stop { trigger_price } => match self.side {
+                Side::Buy => market_price >= trigger_price,
+                Side::Sell => market_price <= trigger_price,
+            },
+            OrderType::StopLimit { trigger_price, .. } => match self.side {
+                Side::Buy => market_price >= trigger_price,
+                Side::Sell => market_price <= trigger_price,
+            },
+            OrderType::TrailingStop { trail_amount } => {
+                let best = self.best_price.unwrap_or(market_price);
+                match self.side {
+                    Side::Buy => market_price >= best + trail_amount,
+                    Side::Sell => market_price <= best - trail_amount,
+                }
+            }
+            _ => false,
+        };
+
+        if triggered {
+            let exec_type = match self.order_type {
+                OrderType::Stop { .. } => OrderType::Market,
+                OrderType::TrailingStop { .. } => OrderType::Market,
+                OrderType::StopLimit { limit_price, .. } => OrderType::Limit { price: limit_price },
+                other => other,
+            };
+            self.transition_to(OrderStatus::Accepted)?;
+            Ok(Some(exec_type))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// TrailingStop 注文の best_price を市場価格で追従更新する。
+    /// 有利な方向（Buy なら上昇、Sell なら下落）のみ更新。
+    pub fn update_trailing_best(&mut self, market_price: Decimal) {
+        if !matches!(self.order_type, OrderType::TrailingStop { .. }) {
+            return;
+        }
+        if self.status != OrderStatus::PendingTrigger {
+            return;
+        }
+        self.best_price = Some(match self.side {
+            Side::Buy => self.best_price.map_or(market_price, |b| b.min(market_price)),
+            Side::Sell => self.best_price.map_or(market_price, |b| b.max(market_price)),
+        });
+    }
+
     /// Limit 注文の場合に価格を返す
     pub fn limit_price(&self) -> Option<Decimal> {
         match self.order_type {
             OrderType::Limit { price } => Some(price),
-            OrderType::Market => None,
+            _ => None,
         }
+    }
+
+    /// Stop 系注文かどうか
+    pub fn is_stop_type(&self) -> bool {
+        matches!(
+            self.order_type,
+            OrderType::Stop { .. } | OrderType::StopLimit { .. } | OrderType::TrailingStop { .. }
+        )
     }
 }
 
@@ -315,6 +422,7 @@ mod tests {
     #[test]
     fn status_is_open_and_terminal() {
         assert!(OrderStatus::New.is_open());
+        assert!(OrderStatus::PendingTrigger.is_open());
         assert!(OrderStatus::Accepted.is_open());
         assert!(OrderStatus::PartiallyFilled.is_open());
         assert!(!OrderStatus::Filled.is_open());
@@ -325,5 +433,82 @@ mod tests {
         assert!(OrderStatus::Cancelled.is_terminal());
         assert!(OrderStatus::Rejected.is_terminal());
         assert!(!OrderStatus::New.is_terminal());
+        assert!(!OrderStatus::PendingTrigger.is_terminal());
+    }
+
+    #[test]
+    fn stop_buy_triggers_when_price_reaches_trigger() {
+        let mut order = Order::new(
+            "BTC/USD".into(),
+            Side::Buy,
+            OrderType::Stop { trigger_price: dec!(66000) },
+            dec!(1.0),
+            TimeInForce::GTC,
+        );
+        order.pending_trigger().unwrap();
+        // 未達
+        assert!(order.check_trigger(dec!(65999)).unwrap().is_none());
+        assert_eq!(order.status, OrderStatus::PendingTrigger);
+        // 到達
+        let exec = order.check_trigger(dec!(66000)).unwrap();
+        assert_eq!(exec, Some(OrderType::Market));
+        assert_eq!(order.status, OrderStatus::Accepted);
+    }
+
+    #[test]
+    fn stop_sell_triggers_when_price_drops() {
+        let mut order = Order::new(
+            "BTC/USD".into(),
+            Side::Sell,
+            OrderType::Stop { trigger_price: dec!(64000) },
+            dec!(1.0),
+            TimeInForce::GTC,
+        );
+        order.pending_trigger().unwrap();
+        assert!(order.check_trigger(dec!(64001)).unwrap().is_none());
+        let exec = order.check_trigger(dec!(64000)).unwrap();
+        assert_eq!(exec, Some(OrderType::Market));
+    }
+
+    #[test]
+    fn stop_limit_triggers_returns_limit_type() {
+        let mut order = Order::new(
+            "BTC/USD".into(),
+            Side::Buy,
+            OrderType::StopLimit { trigger_price: dec!(66000), limit_price: dec!(66100) },
+            dec!(1.0),
+            TimeInForce::GTC,
+        );
+        order.pending_trigger().unwrap();
+        let exec = order.check_trigger(dec!(66000)).unwrap();
+        assert_eq!(exec, Some(OrderType::Limit { price: dec!(66100) }));
+    }
+
+    #[test]
+    fn trailing_stop_sell_follows_best_price() {
+        let mut order = Order::new(
+            "BTC/USD".into(),
+            Side::Sell,
+            OrderType::TrailingStop { trail_amount: dec!(1000) },
+            dec!(1.0),
+            TimeInForce::GTC,
+        );
+        order.pending_trigger().unwrap();
+
+        // 初期 best_price を 68000 に設定
+        order.update_trailing_best(dec!(68000));
+        assert_eq!(order.best_price, Some(dec!(68000)));
+
+        // 価格上昇 → best_price 更新
+        order.update_trailing_best(dec!(70000));
+        assert_eq!(order.best_price, Some(dec!(70000)));
+
+        // 価格下落だが trail_amount 未満 → 未トリガー
+        let r = order.check_trigger(dec!(69500)).unwrap();
+        assert!(r.is_none());
+
+        // trail_amount (1000) 以上の下落 → トリガー
+        let r = order.check_trigger(dec!(69000)).unwrap();
+        assert_eq!(r, Some(OrderType::Market));
     }
 }

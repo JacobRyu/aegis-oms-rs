@@ -45,6 +45,15 @@ impl OrderStore for InMemoryOrderStore {
     }
 }
 
+impl InMemoryOrderStore {
+    pub fn find_pending_trigger_orders(&self) -> Vec<&Order> {
+        self.orders
+            .values()
+            .filter(|o| o.status == crate::domain::order::OrderStatus::PendingTrigger)
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
