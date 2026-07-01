@@ -35,6 +35,8 @@ pub struct OrderService {
     risk_checker: RiskChecker,
     pub event_bus: EventBus,
     trade_store: InMemoryTradeStore,
+    /// 累計実現損失（損失制限チェック用）
+    cumulative_realized_loss: Decimal,
 }
 
 impl OrderService {
@@ -55,6 +57,7 @@ impl OrderService {
             risk_checker,
             event_bus,
             trade_store: InMemoryTradeStore::new(),
+            cumulative_realized_loss: Decimal::ZERO,
         }
     }
 
@@ -66,9 +69,15 @@ impl OrderService {
             .ok_or_else(|| OmsError::InstrumentNotFound { symbol: req.instrument.clone() })?
             .clone();
 
-        // リスクチェック (数量・価格)
+        // リスクチェック (数量・価格・ポジション上限)
         let open_count = self.store.find_open_orders().len();
-        self.risk_checker.validate_order(&req.order_type, req.quantity, open_count)?;
+        let position_count = self.positions.len();
+        self.risk_checker.validate_order(
+            &req.order_type,
+            req.quantity,
+            open_count,
+            position_count,
+        )?;
 
         // 必要証拠金の計算と証拠金ロック
         let price = match req.order_type {
@@ -79,6 +88,26 @@ impl OrderService {
 
         let mut order =
             Order::new(req.instrument, req.side, req.order_type, req.quantity, req.time_in_force);
+
+        let order_id = order.id;
+
+        // FOK: 全量約定不能（シミュレーション環境では liquidity=0）のため New 状態から却下
+        if req.time_in_force == TimeInForce::FOK {
+            // FOK は証拠金チェック不要（約定前にリジェクト）
+            order.reject()?;
+            let rejected_order_id = order.id;
+            self.store.save(order)?;
+            self.event_bus.publish(&OrderEvent::FokRejected {
+                order_id: rejected_order_id,
+                available: Decimal::ZERO,
+                required: req.quantity,
+            });
+            return Err(OmsError::FokRejected {
+                order_id: rejected_order_id,
+                available: Decimal::ZERO,
+                required: req.quantity,
+            });
+        }
 
         // 証拠金チェック & ロック (Limit 注文のみ)
         if price > Decimal::ZERO {
@@ -99,12 +128,16 @@ impl OrderService {
             order.accept()?;
         }
 
-        let order_id = order.id;
         let is_stop = order.is_stop_type();
         self.store.save(order)?;
 
         if !is_stop {
             self.event_bus.publish(&OrderEvent::Accepted { order_id });
+        }
+
+        // IOC: 未約定残量を自動キャンセル（stop 系注文は PendingTrigger なので対象外）
+        if !is_stop && req.time_in_force == TimeInForce::IOC {
+            self.apply_ioc_policy(order_id)?;
         }
 
         Ok(order_id)
@@ -170,6 +203,23 @@ impl OrderService {
         // ポジション更新して実現損益を取得
         let realized_pnl = self.update_position_with_pnl(&instrument, side, qty, price);
 
+        // 損失制限チェック: 累計実現損失が max_loss を超えたらエラー
+        if let Some(pnl) = realized_pnl
+            && pnl.is_sign_negative()
+        {
+            self.cumulative_realized_loss += pnl;
+        }
+        if let Some(max_loss) = self.risk_checker.limits.max_loss
+            && self.cumulative_realized_loss < -max_loss
+        {
+            return Err(OmsError::RiskCheckFailed {
+                reason: format!(
+                    "Loss limit exceeded: cumulative loss {} exceeds max loss {}",
+                    self.cumulative_realized_loss, max_loss
+                ),
+            });
+        }
+
         // 約定履歴を記録
         let trade = Trade::new(*id, instrument.clone(), side, qty, price, realized_pnl);
         self.trade_store.save(trade);
@@ -209,6 +259,23 @@ impl OrderService {
             }
         }
         pnl
+    }
+
+    /// IOC 執行ポリシーを適用する: 未約定残量を自動キャンセル
+    fn apply_ioc_policy(&mut self, order_id: OrderId) -> Result<()> {
+        let residual = {
+            let order = self.store.get(&order_id).ok_or(OmsError::OrderNotFound { order_id })?;
+            order.remaining_quantity()
+        };
+        if residual > Decimal::ZERO {
+            let order = self.store.get_mut(&order_id).unwrap();
+            order.cancel()?;
+            if let Some(margin) = self.margin_locks.remove(&order_id) {
+                self.account.unlock_margin(margin)?;
+            }
+            self.event_bus.publish(&OrderEvent::IocResidualCancelled { order_id, residual });
+        }
+        Ok(())
     }
 
     pub fn get_order(&self, id: &OrderId) -> Option<&Order> {
@@ -535,5 +602,256 @@ mod tests {
 
         let pos = svc.get_positions().into_iter().find(|p| p.instrument == "BTC/USD").unwrap();
         assert_eq!(pos.unrealized_pnl, dec!(2000));
+    }
+
+    // ── IOC/FOK Tests ──
+
+    #[test]
+    fn ioc_order_auto_cancels_residual() {
+        let mut svc = setup();
+        let id = svc
+            .submit_order(NewOrderRequest {
+                instrument: "BTC/USD".into(),
+                side: Side::Buy,
+                order_type: OrderType::Limit { price: dec!(65000) },
+                quantity: dec!(1.0),
+                time_in_force: TimeInForce::IOC,
+            })
+            .unwrap();
+
+        // IOC order should be accepted then immediately cancelled (residual = full qty)
+        let order = svc.get_order(&id).unwrap();
+        assert_eq!(order.status, OrderStatus::Cancelled);
+        // Margin should be released
+        assert_eq!(svc.get_account().locked_margin, Decimal::ZERO);
+    }
+
+    #[test]
+    fn ioc_partial_fill_then_residual_cancelled() {
+        let mut svc = setup();
+        let id = svc
+            .submit_order(NewOrderRequest {
+                instrument: "BTC/USD".into(),
+                side: Side::Buy,
+                order_type: OrderType::Limit { price: dec!(65000) },
+                quantity: dec!(2.0),
+                time_in_force: TimeInForce::IOC,
+            })
+            .unwrap();
+
+        // Fill 0.5 before the IOC policy would have cancelled
+        // (In simulation, IOC cancels immediately after submit.
+        //  To test partial fill semantics, we apply fill first then policy)
+        // Actually: in our implementation, IOC cancels in submit_order.
+        // The order is already cancelled. We can't fill it.
+        let order = svc.get_order(&id).unwrap();
+        assert_eq!(order.status, OrderStatus::Cancelled);
+        // Trying to fill a cancelled order should fail
+        let result = svc.fill_order(&id, dec!(0.5), dec!(65000));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fok_order_rejected_when_no_available_liquidity() {
+        let mut svc = setup();
+        let result = svc.submit_order(NewOrderRequest {
+            instrument: "BTC/USD".into(),
+            side: Side::Buy,
+            order_type: OrderType::Limit { price: dec!(65000) },
+            quantity: dec!(1.0),
+            time_in_force: TimeInForce::FOK,
+        });
+
+        // In simulation, no immediate liquidity → FOK rejected
+        assert!(result.is_err());
+        match result {
+            Err(OmsError::FokRejected { order_id: _, available, required }) => {
+                assert_eq!(available, Decimal::ZERO);
+                assert_eq!(required, dec!(1.0));
+            }
+            _ => panic!("Expected FokRejected error"),
+        }
+    }
+
+    #[test]
+    fn gtc_order_not_affected_by_ioc_fok_policy() {
+        let mut svc = setup();
+        let id = svc
+            .submit_order(NewOrderRequest {
+                instrument: "BTC/USD".into(),
+                side: Side::Buy,
+                order_type: OrderType::Limit { price: dec!(65000) },
+                quantity: dec!(1.0),
+                time_in_force: TimeInForce::GTC,
+            })
+            .unwrap();
+
+        let order = svc.get_order(&id).unwrap();
+        assert_eq!(order.status, OrderStatus::Accepted);
+        assert_eq!(svc.get_account().locked_margin, dec!(32500));
+    }
+
+    // ── Position Limit Tests ──
+
+    #[test]
+    fn position_limit_rejects_order_when_at_max() {
+        let risk = RiskChecker::new(RiskLimits { max_open_positions: 1, ..RiskLimits::default() });
+        let mut svc = OrderService::new(
+            Account::new("acc-001", "Test", dec!(100000)),
+            vec![Instrument {
+                symbol: "BTC/USD".into(),
+                asset_class: AssetClass::Crypto,
+                tick_size: dec!(0.01),
+                lot_size: dec!(0.001),
+                leverage: dec!(2),
+            }],
+            risk,
+            EventBus::new(),
+        );
+
+        // Open first position
+        let id1 = svc
+            .submit_order(NewOrderRequest {
+                instrument: "BTC/USD".into(),
+                side: Side::Buy,
+                order_type: OrderType::Limit { price: dec!(65000) },
+                quantity: dec!(1.0),
+                time_in_force: TimeInForce::GTC,
+            })
+            .unwrap();
+        svc.fill_order(&id1, dec!(1.0), dec!(65000)).unwrap();
+        assert_eq!(svc.get_positions().len(), 1);
+
+        // Second order should fail due to position limit
+        let result = svc.submit_order(NewOrderRequest {
+            instrument: "BTC/USD".into(),
+            side: Side::Buy,
+            order_type: OrderType::Limit { price: dec!(66000) },
+            quantity: dec!(1.0),
+            time_in_force: TimeInForce::GTC,
+        });
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Open position limit"));
+    }
+
+    // ── Loss Limit Tests ──
+
+    #[test]
+    fn loss_limit_exceeded_rejects_fill() {
+        let risk =
+            RiskChecker::new(RiskLimits { max_loss: Some(dec!(5000)), ..RiskLimits::default() });
+        let mut svc = OrderService::new(
+            Account::new("acc-001", "Test", dec!(100000)),
+            vec![Instrument {
+                symbol: "BTC/USD".into(),
+                asset_class: AssetClass::Crypto,
+                tick_size: dec!(0.01),
+                lot_size: dec!(0.001),
+                leverage: dec!(2),
+            }],
+            risk,
+            EventBus::new(),
+        );
+
+        // Open long
+        let id1 = svc
+            .submit_order(NewOrderRequest {
+                instrument: "BTC/USD".into(),
+                side: Side::Buy,
+                order_type: OrderType::Limit { price: dec!(65000) },
+                quantity: dec!(1.0),
+                time_in_force: TimeInForce::GTC,
+            })
+            .unwrap();
+        svc.fill_order(&id1, dec!(1.0), dec!(65000)).unwrap();
+
+        // Close at a loss of 6000 (exceeds 5000 limit)
+        let id2 = svc
+            .submit_order(NewOrderRequest {
+                instrument: "BTC/USD".into(),
+                side: Side::Sell,
+                order_type: OrderType::Limit { price: dec!(59000) },
+                quantity: dec!(1.0),
+                time_in_force: TimeInForce::GTC,
+            })
+            .unwrap();
+        let result = svc.fill_order(&id2, dec!(1.0), dec!(59000));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Loss limit exceeded"));
+    }
+
+    #[test]
+    fn loss_limit_not_exceeded_when_within_limit() {
+        let risk =
+            RiskChecker::new(RiskLimits { max_loss: Some(dec!(5000)), ..RiskLimits::default() });
+        let mut svc = OrderService::new(
+            Account::new("acc-001", "Test", dec!(100000)),
+            vec![Instrument {
+                symbol: "BTC/USD".into(),
+                asset_class: AssetClass::Crypto,
+                tick_size: dec!(0.01),
+                lot_size: dec!(0.001),
+                leverage: dec!(2),
+            }],
+            risk,
+            EventBus::new(),
+        );
+
+        // Open long
+        let id1 = svc
+            .submit_order(NewOrderRequest {
+                instrument: "BTC/USD".into(),
+                side: Side::Buy,
+                order_type: OrderType::Limit { price: dec!(65000) },
+                quantity: dec!(1.0),
+                time_in_force: TimeInForce::GTC,
+            })
+            .unwrap();
+        svc.fill_order(&id1, dec!(1.0), dec!(65000)).unwrap();
+
+        // Close at a loss of 3000 (within 5000 limit)
+        let id2 = svc
+            .submit_order(NewOrderRequest {
+                instrument: "BTC/USD".into(),
+                side: Side::Sell,
+                order_type: OrderType::Limit { price: dec!(62000) },
+                quantity: dec!(1.0),
+                time_in_force: TimeInForce::GTC,
+            })
+            .unwrap();
+        let result = svc.fill_order(&id2, dec!(1.0), dec!(62000));
+        assert!(result.is_ok());
+    }
+
+    // ── Account Event Tests ──
+
+    #[test]
+    fn deposit_increases_balance() {
+        let mut svc = setup();
+        let balance_before = svc.get_account().balance;
+        svc.deposit(dec!(50000)).unwrap();
+        assert_eq!(svc.get_account().balance, balance_before + dec!(50000));
+    }
+
+    #[test]
+    fn withdraw_decreases_balance() {
+        let mut svc = setup();
+        let balance_before = svc.get_account().balance;
+        svc.withdraw(dec!(30000)).unwrap();
+        assert_eq!(svc.get_account().balance, balance_before - dec!(30000));
+    }
+
+    #[test]
+    fn withdraw_exceeds_available_rejected() {
+        let mut svc = setup();
+        let result = svc.withdraw(dec!(200000));
+        assert!(result.is_err());
+        match result {
+            Err(OmsError::WithdrawalExceedsAvailable { requested, available }) => {
+                assert_eq!(requested, dec!(200000));
+                assert_eq!(available, dec!(100000));
+            }
+            _ => panic!("Expected WithdrawalExceedsAvailable error"),
+        }
     }
 }

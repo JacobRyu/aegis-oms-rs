@@ -11,6 +11,10 @@ pub struct RiskLimits {
     pub stop_out_ratio: Decimal,
     /// 追証アラート発動水準（証拠金率 %）。デフォルト 100%
     pub margin_call_ratio: Decimal,
+    /// 最大オープンポジション数（デフォルト 20）
+    pub max_open_positions: usize,
+    /// 最大許容損失額（None = 無制限）
+    pub max_loss: Option<Decimal>,
 }
 
 impl Default for RiskLimits {
@@ -20,6 +24,8 @@ impl Default for RiskLimits {
             max_open_orders: 100,
             stop_out_ratio: Decimal::new(50, 0),
             margin_call_ratio: Decimal::new(100, 0),
+            max_open_positions: 20,
+            max_loss: None,
         }
     }
 }
@@ -39,6 +45,7 @@ impl RiskChecker {
         order_type: &OrderType,
         quantity: Decimal,
         open_order_count: usize,
+        open_position_count: usize,
     ) -> Result<()> {
         if quantity <= Decimal::ZERO {
             return Err(OmsError::RiskCheckFailed { reason: "Quantity must be positive".into() });
@@ -91,6 +98,12 @@ impl RiskChecker {
             });
         }
 
+        if open_position_count >= self.limits.max_open_positions {
+            return Err(OmsError::RiskCheckFailed {
+                reason: format!("Open position limit reached ({})", self.limits.max_open_positions),
+            });
+        }
+
         Ok(())
     }
 
@@ -121,55 +134,64 @@ mod tests {
             max_open_orders: 10,
             stop_out_ratio: dec!(50),
             margin_call_ratio: dec!(100),
+            max_open_positions: 5,
+            max_loss: None,
         })
     }
 
     #[test]
     fn valid_limit_order() {
         let c = checker();
-        let result = c.validate_order(&OrderType::Limit { price: dec!(100) }, dec!(10), 0);
+        let result = c.validate_order(&OrderType::Limit { price: dec!(100) }, dec!(10), 0, 0);
         assert!(result.is_ok());
     }
 
     #[test]
     fn valid_market_order() {
         let c = checker();
-        let result = c.validate_order(&OrderType::Market, dec!(10), 0);
+        let result = c.validate_order(&OrderType::Market, dec!(10), 0, 0);
         assert!(result.is_ok());
     }
 
     #[test]
     fn zero_quantity_rejected() {
         let c = checker();
-        let result = c.validate_order(&OrderType::Market, Decimal::ZERO, 0);
+        let result = c.validate_order(&OrderType::Market, Decimal::ZERO, 0, 0);
         assert!(result.is_err());
     }
 
     #[test]
     fn negative_quantity_rejected() {
         let c = checker();
-        let result = c.validate_order(&OrderType::Market, dec!(-1), 0);
+        let result = c.validate_order(&OrderType::Market, dec!(-1), 0, 0);
         assert!(result.is_err());
     }
 
     #[test]
     fn exceeds_max_quantity() {
         let c = checker();
-        let result = c.validate_order(&OrderType::Market, dec!(1001), 0);
+        let result = c.validate_order(&OrderType::Market, dec!(1001), 0, 0);
         assert!(result.is_err());
     }
 
     #[test]
     fn negative_limit_price_rejected() {
         let c = checker();
-        let result = c.validate_order(&OrderType::Limit { price: dec!(-50) }, dec!(10), 0);
+        let result = c.validate_order(&OrderType::Limit { price: dec!(-50) }, dec!(10), 0, 0);
         assert!(result.is_err());
     }
 
     #[test]
     fn open_order_limit_reached() {
         let c = checker();
-        let result = c.validate_order(&OrderType::Market, dec!(10), 10);
+        let result = c.validate_order(&OrderType::Market, dec!(10), 10, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn open_position_limit_reached() {
+        let c = checker();
+        let result = c.validate_order(&OrderType::Market, dec!(10), 0, 5);
         assert!(result.is_err());
     }
 

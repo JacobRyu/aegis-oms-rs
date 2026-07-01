@@ -133,6 +133,8 @@ pub enum AccountEvent {
     MarginLocked { account_id: AccountId, order_id: OrderId, amount: Decimal },
     MarginReleased { account_id: AccountId, order_id: OrderId, amount: Decimal },
     PnlApplied { account_id: AccountId, pnl: Decimal, new_balance: Decimal },
+    Deposited { account_id: AccountId, amount: Decimal, new_balance: Decimal },
+    Withdrawn { account_id: AccountId, amount: Decimal, new_balance: Decimal },
 }
 
 #[cfg(test)]

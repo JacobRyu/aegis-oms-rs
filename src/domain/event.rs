@@ -47,4 +47,15 @@ pub enum OrderEvent {
         order_id: OrderId,
         best_price: Decimal,
     },
+    /// IOC 注文の未約定残量が自動キャンセルされた
+    IocResidualCancelled {
+        order_id: OrderId,
+        residual: Decimal,
+    },
+    /// FOK 注文が全量約定できずリジェクトされた
+    FokRejected {
+        order_id: OrderId,
+        available: Decimal,
+        required: Decimal,
+    },
 }
