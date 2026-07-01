@@ -1,73 +1,12 @@
-use std::io::{self, Write};
+mod cli;
 
 use aegis_oms::domain::account::Account;
 use aegis_oms::domain::instrument::{AssetClass, Instrument};
-use aegis_oms::domain::order::*;
-use aegis_oms::domain::risk_engine::MarginStatus;
 use aegis_oms::infra::event_bus::EventBus;
-use aegis_oms::service::order_service::{NewOrderRequest, OrderService};
+use aegis_oms::service::order_service::OrderService;
 use aegis_oms::service::risk_check::{RiskChecker, RiskLimits};
-use clap::{Parser, Subcommand};
-use rust_decimal::Decimal;
+use clap::Parser;
 use rust_decimal_macros::dec;
-
-#[derive(Parser)]
-#[command(name = "aegis-oms", about = "Order Management System for FX and Crypto")]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Submit a new order
-    Submit {
-        #[arg(short, long)]
-        instrument: String,
-        #[arg(short, long)]
-        side: String,
-        #[arg(short = 't', long, default_value = "limit")]
-        r#type: String,
-        #[arg(short, long, default_value = "0")]
-        price: Decimal,
-        #[arg(short, long)]
-        qty: Decimal,
-    },
-    /// List open orders
-    List,
-    /// Cancel an order
-    Cancel {
-        /// Order ID
-        id: String,
-    },
-    /// Show account balance
-    Account,
-    /// Show open positions
-    Positions,
-    /// Show trade history
-    History {
-        /// Filter by instrument (optional)
-        #[arg(short, long)]
-        instrument: Option<String>,
-    },
-    /// Show real-time margin status
-    Margin {
-        /// Mark price for an instrument (format: SYMBOL:PRICE, repeatable)
-        #[arg(short = 'p', long = "price")]
-        prices: Vec<String>,
-    },
-    /// Simulate a fill (for testing)
-    Fill {
-        /// Order ID
-        id: String,
-        #[arg(short, long)]
-        qty: Decimal,
-        #[arg(short, long)]
-        price: Decimal,
-    },
-    /// Interactive REPL mode
-    Repl,
-}
 
 fn default_instruments() -> Vec<Instrument> {
     vec![
@@ -110,302 +49,33 @@ fn create_service() -> OrderService {
     OrderService::new(account, instruments, risk, bus)
 }
 
-fn parse_side(s: &str) -> Result<Side, String> {
-    match s.to_lowercase().as_str() {
-        "buy" | "b" => Ok(Side::Buy),
-        "sell" | "s" => Ok(Side::Sell),
-        _ => Err(format!("Invalid side: {s}. Use 'buy' or 'sell'")),
-    }
-}
-
-fn parse_order_type(type_str: &str, price: Decimal) -> OrderType {
-    match type_str.to_lowercase().as_str() {
-        "market" | "m" => OrderType::Market,
-        _ => OrderType::Limit { price },
-    }
-}
-
-fn handle_submit(
-    svc: &mut OrderService,
-    instrument: &str,
-    side_str: &str,
-    type_str: &str,
-    price: Decimal,
-    qty: Decimal,
-) {
-    let side = match parse_side(side_str) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            return;
-        }
-    };
-    let order_type = parse_order_type(type_str, price);
-
-    match svc.submit_order(NewOrderRequest {
-        instrument: instrument.into(),
-        side,
-        order_type,
-        quantity: qty,
-        time_in_force: TimeInForce::GTC,
-    }) {
-        Ok(id) => println!("Order created: {id}"),
-        Err(e) => eprintln!("Error: {e}"),
-    }
-}
-
-fn handle_list(svc: &OrderService) {
-    let orders = svc.get_open_orders();
-    if orders.is_empty() {
-        println!("No open orders.");
-        return;
-    }
-    println!(
-        "{:<28} {:<10} {:<5} {:<12} {:<10} {:<8} STATUS",
-        "ID", "INSTRUMENT", "SIDE", "TYPE", "QTY", "FILLED"
-    );
-    for o in orders {
-        println!(
-            "{:<28} {:<10} {:<5} {:<12} {:<10} {:<8} {}",
-            o.id, o.instrument, o.side, o.order_type, o.quantity, o.filled_quantity, o.status,
-        );
-    }
-}
-
-fn handle_account(svc: &OrderService) {
-    let acc = svc.get_account();
-    println!("{:<28} {:<10} {:<14} {:<14} AVAILABLE", "ID", "NAME", "BALANCE", "LOCKED");
-    println!(
-        "{:<28} {:<10} {:<14} {:<14} {}",
-        acc.id,
-        acc.name,
-        acc.balance,
-        acc.locked_margin,
-        acc.available_balance()
-    );
-}
-
-fn handle_positions(svc: &OrderService) {
-    let positions = svc.get_positions();
-    if positions.is_empty() {
-        println!("No open positions.");
-        return;
-    }
-    println!("{:<10} {:<5} {:<10} {:<12} UNREALIZED_PNL", "INSTRUMENT", "SIDE", "QTY", "AVG_PRICE");
-    for p in positions {
-        println!(
-            "{:<10} {:<5} {:<10} {:<12} {}",
-            p.instrument, p.side, p.quantity, p.avg_price, p.unrealized_pnl,
-        );
-    }
-}
-
-fn handle_history(svc: &OrderService, instrument: Option<&str>) {
-    let trades = svc.get_trade_history(instrument);
-    if trades.is_empty() {
-        println!("No trade history.");
-        return;
-    }
-    println!("{:<28} {:<10} {:<5} {:<10} {:<12} PNL", "ID", "INSTRUMENT", "SIDE", "QTY", "PRICE");
-    for t in trades {
-        println!(
-            "{:<28} {:<10} {:<5} {:<10} {:<12} {}",
-            t.id,
-            t.instrument,
-            t.side,
-            t.quantity,
-            t.price,
-            t.realized_pnl.map_or("-".into(), |p| p.to_string()),
-        );
-    }
-}
-
-fn parse_mark_prices(prices: &[String]) -> std::collections::HashMap<String, Decimal> {
-    prices
-        .iter()
-        .filter_map(|s| {
-            let mut parts = s.splitn(2, ':');
-            let sym = parts.next()?.to_string();
-            let price: Decimal = parts.next()?.parse().ok()?;
-            Some((sym, price))
-        })
-        .collect()
-}
-
-fn handle_margin(svc: &OrderService, mark_prices: &std::collections::HashMap<String, Decimal>) {
-    let leverages: std::collections::HashMap<String, Decimal> =
-        svc.instruments.iter().map(|(sym, inst)| (sym.clone(), inst.leverage)).collect();
-
-    let positions: Vec<_> = svc.get_positions();
-    let status = MarginStatus::calculate(
-        svc.get_account(),
-        &positions,
-        mark_prices,
-        &leverages,
-        dec!(100),
-        dec!(50),
-    );
-
-    let level_str = match status.level {
-        aegis_oms::domain::risk_engine::MarginLevel::Normal => "Normal",
-        aegis_oms::domain::risk_engine::MarginLevel::MarginCall => "⚠ MarginCall",
-        aegis_oms::domain::risk_engine::MarginLevel::StopOut => "🚨 StopOut",
-    };
-
-    println!(
-        "{:<20} {:<20} {:<20} {:<20} {:<20} LEVEL",
-        "EQUITY", "USED_MARGIN", "FREE_MARGIN", "MARGIN_RATIO%", "EFF_LEVERAGE"
-    );
-    println!(
-        "{:<20} {:<20} {:<20} {:<20} {:<20} {}",
-        status.equity,
-        status.used_margin,
-        status.free_margin,
-        format!("{:.2}", status.margin_ratio),
-        format!("{:.2}", status.effective_leverage),
-        level_str,
-    );
-}
-
-fn handle_cancel(svc: &mut OrderService, id_str: &str) {
-    let id = match ulid::Ulid::from_string(id_str) {
-        Ok(ulid) => OrderId(ulid),
-        Err(e) => {
-            eprintln!("Invalid order ID: {e}");
-            return;
-        }
-    };
-    match svc.cancel_order(&id) {
-        Ok(()) => println!("Order cancelled: {id}"),
-        Err(e) => eprintln!("Error: {e}"),
-    }
-}
-
-fn handle_fill(svc: &mut OrderService, id_str: &str, qty: Decimal, price: Decimal) {
-    let id = match ulid::Ulid::from_string(id_str) {
-        Ok(ulid) => OrderId(ulid),
-        Err(e) => {
-            eprintln!("Invalid order ID: {e}");
-            return;
-        }
-    };
-    match svc.fill_order(&id, qty, price) {
-        Ok(()) => println!("Order filled: {id} qty={qty} price={price}"),
-        Err(e) => eprintln!("Error: {e}"),
-    }
-}
-
-fn run_repl(svc: &mut OrderService) {
-    println!("Aegis OMS REPL (type 'help' for commands, 'quit' to exit)");
-    loop {
-        print!("aegis> ");
-        io::stdout().flush().unwrap();
-
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_err() || input.is_empty() {
-            break;
-        }
-        let parts: Vec<&str> = input.split_whitespace().collect();
-        if parts.is_empty() {
-            continue;
-        }
-
-        match parts[0] {
-            "help" | "h" => {
-                println!("Commands:");
-                println!("  submit <instrument> <buy|sell> <limit|market> <price> <qty>");
-                println!("  list                  - List open orders");
-                println!("  cancel <order_id>     - Cancel an order");
-                println!("  fill <order_id> <qty> <price> - Simulate a fill");
-                println!("  account               - Show account balance");
-                println!("  positions             - Show open positions");
-                println!("  history [instrument]  - Show trade history");
-                println!("  margin [SYMBOL:PRICE ...] - Show margin status");
-                println!("  quit                  - Exit REPL");
-            }
-            "submit" | "s" if parts.len() >= 6 => {
-                let price: Decimal = match parts[4].parse() {
-                    Ok(v) => v,
-                    Err(_) => {
-                        eprintln!(
-                            "Error: Invalid price format '{}'. Expected a decimal number.",
-                            parts[4]
-                        );
-                        continue;
-                    }
-                };
-                let qty: Decimal = match parts[5].parse() {
-                    Ok(v) => v,
-                    Err(_) => {
-                        eprintln!(
-                            "Error: Invalid quantity format '{}'. Expected a decimal number.",
-                            parts[5]
-                        );
-                        continue;
-                    }
-                };
-                handle_submit(svc, parts[1], parts[2], parts[3], price, qty);
-            }
-            "list" | "l" => handle_list(svc),
-            "cancel" | "c" if parts.len() >= 2 => handle_cancel(svc, parts[1]),
-            "fill" | "f" if parts.len() >= 4 => {
-                let qty: Decimal = match parts[2].parse() {
-                    Ok(v) => v,
-                    Err(_) => {
-                        eprintln!(
-                            "Error: Invalid quantity format '{}'. Expected a decimal number.",
-                            parts[2]
-                        );
-                        continue;
-                    }
-                };
-                let price: Decimal = match parts[3].parse() {
-                    Ok(v) => v,
-                    Err(_) => {
-                        eprintln!(
-                            "Error: Invalid price format '{}'. Expected a decimal number.",
-                            parts[3]
-                        );
-                        continue;
-                    }
-                };
-                handle_fill(svc, parts[1], qty, price);
-            }
-            "account" | "a" => handle_account(svc),
-            "positions" | "p" => handle_positions(svc),
-            "history" => {
-                let instrument = parts.get(1).copied();
-                handle_history(svc, instrument);
-            }
-            "margin" | "m" => {
-                let price_args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
-                let mark_prices = parse_mark_prices(&price_args);
-                handle_margin(svc, &mark_prices);
-            }
-            "quit" | "q" | "exit" => break,
-            _ => eprintln!("Unknown command. Type 'help' for usage."),
-        }
-    }
-}
-
 fn main() {
-    let cli = Cli::parse();
+    tracing_subscriber::fmt::init();
+    let cli = cli::Cli::parse();
     let mut svc = create_service();
 
     match cli.command {
-        Some(Commands::Submit { instrument, side, r#type, price, qty }) => {
-            handle_submit(&mut svc, &instrument, &side, &r#type, price, qty)
+        Some(cli::Commands::Submit { instrument, side, r#type, price, qty }) => {
+            cli::handlers::handle_submit(&mut svc, &instrument, &side, &r#type, price, qty)
         }
-        Some(Commands::List) => handle_list(&svc),
-        Some(Commands::Cancel { id }) => handle_cancel(&mut svc, &id),
-        Some(Commands::Fill { id, qty, price }) => handle_fill(&mut svc, &id, qty, price),
-        Some(Commands::Account) => handle_account(&svc),
-        Some(Commands::Positions) => handle_positions(&svc),
-        Some(Commands::History { instrument }) => handle_history(&svc, instrument.as_deref()),
-        Some(Commands::Margin { prices }) => {
-            let mark_prices = parse_mark_prices(&prices);
-            handle_margin(&svc, &mark_prices);
+        Some(cli::Commands::List) => cli::handlers::handle_list(&svc),
+        Some(cli::Commands::Cancel { id }) => cli::handlers::handle_cancel(&mut svc, &id),
+        Some(cli::Commands::Fill { id, qty, price }) => {
+            cli::handlers::handle_fill(&mut svc, &id, qty, price)
         }
-        Some(Commands::Repl) | None => run_repl(&mut svc),
+        Some(cli::Commands::Deposit { amount }) => cli::handlers::handle_deposit(&mut svc, amount),
+        Some(cli::Commands::Withdraw { amount }) => {
+            cli::handlers::handle_withdraw(&mut svc, amount)
+        }
+        Some(cli::Commands::Account) => cli::handlers::handle_account(&svc),
+        Some(cli::Commands::Positions) => cli::handlers::handle_positions(&svc),
+        Some(cli::Commands::History { instrument }) => {
+            cli::handlers::handle_history(&svc, instrument.as_deref())
+        }
+        Some(cli::Commands::Margin { prices }) => {
+            let mark_prices = cli::handlers::parse_mark_prices(&prices);
+            cli::handlers::handle_margin(&svc, &mark_prices);
+        }
+        Some(cli::Commands::Repl) | None => cli::repl::run_repl(&mut svc),
     }
 }

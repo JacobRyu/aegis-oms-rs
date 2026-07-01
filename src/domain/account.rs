@@ -68,6 +68,30 @@ impl Account {
     pub fn apply_realized_pnl(&mut self, pnl: Decimal) {
         self.balance += pnl;
     }
+
+    /// 入金
+    pub fn deposit(&mut self, amount: Decimal) -> Result<()> {
+        if amount <= Decimal::ZERO {
+            return Err(OmsError::InvalidMarginAmount { amount });
+        }
+        self.balance += amount;
+        Ok(())
+    }
+
+    /// 出金（利用可能残高を超える出金は拒否）
+    pub fn withdraw(&mut self, amount: Decimal) -> Result<()> {
+        if amount <= Decimal::ZERO {
+            return Err(OmsError::InvalidMarginAmount { amount });
+        }
+        if amount > self.available_balance() {
+            return Err(OmsError::WithdrawalExceedsAvailable {
+                requested: amount,
+                available: self.available_balance(),
+            });
+        }
+        self.balance -= amount;
+        Ok(())
+    }
 }
 
 impl std::fmt::Display for Account {

@@ -14,6 +14,7 @@ rust_decimal_macros = "1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ulid = { version = "1", features = ["serde"] }
 
 [dev-dependencies]

@@ -36,4 +36,13 @@ pub enum OmsError {
 
     #[error("Alert send failed: {reason}")]
     AlertFailed { reason: String },
+
+    #[error("Withdrawal exceeds available balance: requested {requested}, available {available}")]
+    WithdrawalExceedsAvailable { requested: Decimal, available: Decimal },
+
+    #[error("IOC order partially filled; residual {residual} cancelled for order {order_id}")]
+    IocResidualCancelled { order_id: OrderId, residual: Decimal },
+
+    #[error("FOK order rejected: available {available} < required {required} for order {order_id}")]
+    FokRejected { order_id: OrderId, available: Decimal, required: Decimal },
 }

@@ -227,6 +227,16 @@ impl OrderService {
         &self.account
     }
 
+    /// 入金
+    pub fn deposit(&mut self, amount: Decimal) -> Result<()> {
+        self.account.deposit(amount)
+    }
+
+    /// 出金
+    pub fn withdraw(&mut self, amount: Decimal) -> Result<()> {
+        self.account.withdraw(amount)
+    }
+
     /// 全ポジションの未実現損益を市場価格で更新する
     ///
     /// `mark_prices` は銘柄シンボル → 現在市場価格のマップ。
