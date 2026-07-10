@@ -1,7 +1,7 @@
 # Aegis OMS — 実装計画書
 
 > 作成日: 2026-07-01
-> 対象リポジトリ: `jacobryuu/aegis-oms-rs`
+> 対象リポジトリ: `jacobryu/aegis-oms-rs`
 > ベースライン: テスト 77件 全パス、Rust 2024 edition
 
 ---
