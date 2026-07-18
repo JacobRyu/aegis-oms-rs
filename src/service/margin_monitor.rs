@@ -44,8 +44,11 @@ impl MarginMonitor {
         order_svc: &mut OrderService,
         mark_prices: &HashMap<String, Decimal>,
     ) -> Result<MarginStatus> {
-        let leverages: HashMap<String, Decimal> =
-            order_svc.instruments.iter().map(|(sym, inst)| (sym.clone(), inst.leverage)).collect();
+        let leverages: HashMap<String, Decimal> = order_svc
+            .get_instruments()
+            .iter()
+            .map(|(sym, inst)| (sym.clone(), inst.leverage))
+            .collect();
 
         let positions: Vec<_> = order_svc.get_positions().into_iter().collect();
 

@@ -2,14 +2,7 @@ use std::collections::HashMap;
 
 use crate::domain::error::Result;
 use crate::domain::order::{Order, OrderId};
-
-pub trait OrderStore {
-    fn save(&mut self, order: Order) -> Result<()>;
-    fn get(&self, id: &OrderId) -> Option<&Order>;
-    fn get_mut(&mut self, id: &OrderId) -> Option<&mut Order>;
-    fn find_by_instrument(&self, symbol: &str) -> Vec<&Order>;
-    fn find_open_orders(&self) -> Vec<&Order>;
-}
+use crate::domain::repository::OrderRepository;
 
 #[derive(Debug, Default)]
 pub struct InMemoryOrderStore {
@@ -20,9 +13,13 @@ impl InMemoryOrderStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    pub fn find_by_instrument(&self, symbol: &str) -> Vec<&Order> {
+        self.orders.values().filter(|o| o.instrument == symbol).collect()
+    }
 }
 
-impl OrderStore for InMemoryOrderStore {
+impl OrderRepository for InMemoryOrderStore {
     fn save(&mut self, order: Order) -> Result<()> {
         self.orders.insert(order.id, order);
         Ok(())
@@ -36,21 +33,19 @@ impl OrderStore for InMemoryOrderStore {
         self.orders.get_mut(id)
     }
 
-    fn find_by_instrument(&self, symbol: &str) -> Vec<&Order> {
-        self.orders.values().filter(|o| o.instrument == symbol).collect()
-    }
-
     fn find_open_orders(&self) -> Vec<&Order> {
         self.orders.values().filter(|o| o.status.is_open()).collect()
     }
-}
 
-impl InMemoryOrderStore {
-    pub fn find_pending_trigger_orders(&self) -> Vec<&Order> {
+    fn find_pending_trigger_orders(&self) -> Vec<&Order> {
         self.orders
             .values()
             .filter(|o| o.status == crate::domain::order::OrderStatus::PendingTrigger)
             .collect()
+    }
+
+    fn all_orders(&self) -> Vec<&Order> {
+        self.orders.values().collect()
     }
 }
 

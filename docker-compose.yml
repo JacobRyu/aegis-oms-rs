@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: aegis-oms-pg
+    environment:
+      POSTGRES_DB: aegis_oms
+      POSTGRES_USER: aegis
+      POSTGRES_PASSWORD: aegis_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d
+
+volumes:
+  pgdata:

@@ -8,7 +8,6 @@ use crate::domain::composite_order::{
 use crate::domain::error::{OmsError, Result};
 use crate::domain::event::OrderEvent;
 use crate::domain::order::{OrderId, OrderStatus, OrderType};
-use crate::infra::order_store::OrderStore;
 use crate::service::order_service::OrderService;
 
 /// 複合注文（IFD / OCO）および Stop 系注文のトリガーを管理するサービス
@@ -54,48 +53,40 @@ impl CompositeOrderService {
     ) -> Result<Vec<OrderId>> {
         let mut triggered_ids = Vec::new();
 
-        let pending_ids: Vec<OrderId> = order_svc
-            .store
-            .find_pending_trigger_orders()
-            .into_iter()
-            .filter(|o| o.instrument == symbol)
-            .map(|o| o.id)
-            .collect();
+        let pending_ids = order_svc.find_pending_trigger_orders_for(symbol);
+
+        let mut events: Vec<OrderEvent> = Vec::new();
 
         for id in pending_ids {
-            let order = match order_svc.store.get_mut(&id) {
+            let order = match order_svc.get_order_mut(&id) {
                 Some(o) => o,
                 None => continue,
             };
 
-            // TrailingStop の best_price を更新
             order.update_trailing_best(market_price);
 
-            // トリガー判定
+            let order_id = order.id;
+            let is_trailing_stop = matches!(order.order_type, OrderType::TrailingStop { .. });
+            let best_price = order.best_price;
+
             match order.check_trigger(market_price)? {
                 Some(exec_type) => {
-                    let order_id = order.id;
-                    order_svc.event_bus.publish(&OrderEvent::StopTriggered {
-                        order_id,
-                        trigger_price: market_price,
-                    });
-                    if let OrderType::TrailingStop { .. } = exec_type {
-                        // TrailingStop も Market として記録
-                    }
+                    events
+                        .push(OrderEvent::StopTriggered { order_id, trigger_price: market_price });
                     triggered_ids.push(order_id);
+                    // TrailingStop も Market として記録
+                    let _ = exec_type;
                 }
                 None => {
-                    // 未トリガー: TrailingStop 更新イベント発行
-                    if matches!(order.order_type, OrderType::TrailingStop { .. })
-                        && let Some(bp) = order.best_price
-                    {
-                        order_svc.event_bus.publish(&OrderEvent::TrailingStopUpdated {
-                            order_id: order.id,
-                            best_price: bp,
-                        });
+                    if is_trailing_stop && let Some(bp) = best_price {
+                        events.push(OrderEvent::TrailingStopUpdated { order_id, best_price: bp });
                     }
                 }
             }
+        }
+
+        for event in events {
+            order_svc.event_bus.publish(&event);
         }
 
         Ok(triggered_ids)

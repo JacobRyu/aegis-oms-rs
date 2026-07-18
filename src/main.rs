@@ -1,58 +1,12 @@
 mod cli;
 
-use aegis_oms::domain::account::Account;
-use aegis_oms::domain::instrument::{AssetClass, Instrument};
-use aegis_oms::infra::event_bus::EventBus;
-use aegis_oms::service::order_service::OrderService;
-use aegis_oms::service::risk_check::{RiskChecker, RiskLimits};
 use clap::Parser;
-use rust_decimal_macros::dec;
-
-fn default_instruments() -> Vec<Instrument> {
-    vec![
-        Instrument {
-            symbol: "USD/JPY".into(),
-            asset_class: AssetClass::Fx,
-            tick_size: dec!(0.001),
-            lot_size: dec!(1000),
-            leverage: dec!(25),
-        },
-        Instrument {
-            symbol: "EUR/USD".into(),
-            asset_class: AssetClass::Fx,
-            tick_size: dec!(0.00001),
-            lot_size: dec!(1000),
-            leverage: dec!(25),
-        },
-        Instrument {
-            symbol: "BTC/USD".into(),
-            asset_class: AssetClass::Crypto,
-            tick_size: dec!(0.01),
-            lot_size: dec!(0.001),
-            leverage: dec!(2),
-        },
-        Instrument {
-            symbol: "ETH/USD".into(),
-            asset_class: AssetClass::Crypto,
-            tick_size: dec!(0.01),
-            lot_size: dec!(0.01),
-            leverage: dec!(2),
-        },
-    ]
-}
-
-fn create_service() -> OrderService {
-    let account = Account::new("acc-001", "Default", dec!(100000));
-    let instruments = default_instruments();
-    let risk = RiskChecker::new(RiskLimits::default());
-    let bus = EventBus::new();
-    OrderService::new(account, instruments, risk, bus)
-}
 
 fn main() {
     tracing_subscriber::fmt::init();
     let cli = cli::Cli::parse();
-    let mut svc = create_service();
+    let mut svc =
+        if let Some(db_url) = &cli.db { create_pg_service(db_url) } else { cli::create_service() };
 
     match cli.command {
         Some(cli::Commands::Submit { instrument, side, r#type, price, qty }) => {
@@ -78,4 +32,62 @@ fn main() {
         }
         Some(cli::Commands::Repl) | None => cli::repl::run_repl(&mut svc),
     }
+}
+
+fn create_pg_service(db_url: &str) -> aegis_oms::service::order_service::OrderService {
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+
+    let pool = rt.block_on(async {
+        aegis_oms::infra::db::create_pool(db_url).await.expect("Failed to connect to PostgreSQL")
+    });
+
+    rt.block_on(async {
+        aegis_oms::infra::db::run_migrations(&pool)
+            .await
+            .expect("Failed to run database migrations");
+    });
+
+    let store = Box::new(aegis_oms::infra::pg_order_repo::PgOrderRepository::new(pool.clone()));
+    let trade_store =
+        Box::new(aegis_oms::infra::pg_trade_repo::PgTradeRepository::new(pool.clone()));
+
+    let account = aegis_oms::domain::account::Account::new(
+        "acc-001",
+        "Default",
+        rust_decimal_macros::dec!(100000),
+    );
+    let instruments = cli::default_instruments();
+    let risk = aegis_oms::service::risk_check::RiskChecker::new(
+        aegis_oms::service::risk_check::RiskLimits::default(),
+    );
+    let bus = aegis_oms::infra::event_bus::EventBus::new();
+
+    let mut svc = aegis_oms::service::order_service::OrderService::with_repos(
+        account,
+        instruments,
+        risk,
+        bus,
+        store,
+        trade_store,
+    );
+
+    // P3-4: セッション間状態の復元
+    let account_balance = rt.block_on(async {
+        sqlx::query_scalar::<_, rust_decimal::Decimal>(
+            "SELECT balance FROM accounts WHERE id = 'acc-001'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .ok()
+        .flatten()
+    });
+
+    if let Some(balance) = account_balance {
+        let acc = svc.get_account_mut();
+        acc.balance = balance;
+        tracing::info!(%balance, "Restored account balance from database");
+    }
+
+    tracing::info!("PostgreSQL persistence enabled");
+    svc
 }

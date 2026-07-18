@@ -8,10 +8,9 @@ use crate::domain::event::OrderEvent;
 use crate::domain::instrument::Instrument;
 use crate::domain::order::*;
 use crate::domain::position::Position;
+use crate::domain::repository::{OrderRepository, TradeRepository};
 use crate::domain::trade::Trade;
 use crate::infra::event_bus::EventBus;
-use crate::infra::order_store::{InMemoryOrderStore, OrderStore};
-use crate::infra::trade_store::InMemoryTradeStore;
 use crate::service::risk_check::RiskChecker;
 
 /// 注文作成リクエスト
@@ -26,7 +25,7 @@ pub struct NewOrderRequest {
 
 /// OrderService: 注文ライフサイクルを統合管理
 pub struct OrderService {
-    pub store: InMemoryOrderStore,
+    pub store: Box<dyn OrderRepository>,
     pub account: Account,
     pub instruments: HashMap<String, Instrument>,
     pub positions: HashMap<String, Position>,
@@ -34,7 +33,7 @@ pub struct OrderService {
     margin_locks: HashMap<OrderId, Decimal>,
     risk_checker: RiskChecker,
     pub event_bus: EventBus,
-    trade_store: InMemoryTradeStore,
+    trade_store: Box<dyn TradeRepository>,
     /// 累計実現損失（損失制限チェック用）
     cumulative_realized_loss: Decimal,
 }
@@ -46,17 +45,35 @@ impl OrderService {
         risk_checker: RiskChecker,
         event_bus: EventBus,
     ) -> Self {
+        Self::with_repos(
+            account,
+            instruments,
+            risk_checker,
+            event_bus,
+            Box::new(crate::infra::order_store::InMemoryOrderStore::new()),
+            Box::new(crate::infra::trade_store::InMemoryTradeStore::new()),
+        )
+    }
+
+    pub fn with_repos(
+        account: Account,
+        instruments: Vec<Instrument>,
+        risk_checker: RiskChecker,
+        event_bus: EventBus,
+        store: Box<dyn OrderRepository>,
+        trade_store: Box<dyn TradeRepository>,
+    ) -> Self {
         let instruments: HashMap<String, Instrument> =
             instruments.into_iter().map(|i| (i.symbol.clone(), i)).collect();
         Self {
-            store: InMemoryOrderStore::new(),
+            store,
             account,
             instruments,
             positions: HashMap::new(),
             margin_locks: HashMap::new(),
             risk_checker,
             event_bus,
-            trade_store: InMemoryTradeStore::new(),
+            trade_store,
             cumulative_realized_loss: Decimal::ZERO,
         }
     }
@@ -222,7 +239,7 @@ impl OrderService {
 
         // 約定履歴を記録
         let trade = Trade::new(*id, instrument.clone(), side, qty, price, realized_pnl);
-        self.trade_store.save(trade);
+        self.trade_store.save(trade)?;
 
         Ok(())
     }
@@ -294,6 +311,10 @@ impl OrderService {
         &self.account
     }
 
+    pub fn get_account_mut(&mut self) -> &mut Account {
+        &mut self.account
+    }
+
     /// 入金
     pub fn deposit(&mut self, amount: Decimal) -> Result<()> {
         self.account.deposit(amount)
@@ -325,6 +346,24 @@ impl OrderService {
             Some(sym) => self.trade_store.by_instrument(sym),
             None => self.trade_store.all(),
         }
+    }
+
+    /// PendingTrigger 状態の注文のうち、指定された銘柄のものを返す
+    pub fn find_pending_trigger_orders_for(&self, symbol: &str) -> Vec<OrderId> {
+        self.store
+            .find_pending_trigger_orders()
+            .into_iter()
+            .filter(|o| o.instrument == symbol)
+            .map(|o| o.id)
+            .collect()
+    }
+
+    pub fn get_order_mut(&mut self, id: &OrderId) -> Option<&mut Order> {
+        self.store.get_mut(id)
+    }
+
+    pub fn get_instruments(&self) -> &HashMap<String, Instrument> {
+        &self.instruments
     }
 }
 

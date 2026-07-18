@@ -10,10 +10,10 @@ BEGIN;
 -- -----------------------------------------------------------
 CREATE TYPE asset_class AS ENUM ('fx', 'crypto');
 CREATE TYPE order_side AS ENUM ('buy', 'sell');
-CREATE TYPE order_type AS ENUM ('market', 'limit');
+CREATE TYPE order_type AS ENUM ('market', 'limit', 'stop', 'stop_limit', 'trailing_stop');
 CREATE TYPE time_in_force AS ENUM ('gtc', 'ioc', 'fok');
 CREATE TYPE order_status AS ENUM (
-    'new', 'accepted', 'partially_filled',
+    'new', 'pending_trigger', 'accepted', 'partially_filled',
     'filled', 'cancelled', 'rejected'
 );
 
@@ -64,6 +64,10 @@ CREATE TABLE orders (
     filled_quantity NUMERIC        NOT NULL DEFAULT 0 CHECK (filled_quantity >= 0),
     time_in_force   time_in_force  NOT NULL DEFAULT 'gtc',
     status          order_status   NOT NULL DEFAULT 'new',
+    trigger_price   NUMERIC,                     -- Stop/StopLimit のトリガー価格
+    limit_price     NUMERIC,                     -- StopLimit の指値価格
+    trail_amount    NUMERIC,                     -- TrailingStop のトレール幅
+    best_price      NUMERIC,                     -- TrailingStop 追従中の最良価格
     created_at      TIMESTAMPTZ    NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ    NOT NULL DEFAULT now(),
     CONSTRAINT chk_limit_price CHECK (
@@ -159,6 +163,27 @@ CREATE TRIGGER trg_orders_updated_at
 
 CREATE TRIGGER trg_positions_updated_at
     BEFORE UPDATE ON positions
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+-- -----------------------------------------------------------
+-- 約定履歴 (trade_history / Trade ドメインモデル対応)
+-- -----------------------------------------------------------
+CREATE TABLE trades (
+    id            TEXT        PRIMARY KEY,  -- ULID
+    order_id      TEXT        NOT NULL REFERENCES orders(id),
+    instrument    TEXT        NOT NULL REFERENCES instruments(symbol),
+    side          order_side  NOT NULL,
+    quantity      NUMERIC     NOT NULL CHECK (quantity > 0),
+    price         NUMERIC     NOT NULL CHECK (price > 0),
+    realized_pnl  NUMERIC,                  -- NULL for new position openings
+    executed_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_trades_order      ON trades (order_id);
+CREATE INDEX idx_trades_instrument ON trades (instrument);
+
+CREATE TRIGGER trg_trades_updated_at
+    BEFORE UPDATE ON trades
     FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 
 COMMIT;

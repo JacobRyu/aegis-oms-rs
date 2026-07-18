@@ -5,5 +5,6 @@ pub mod event;
 pub mod instrument;
 pub mod order;
 pub mod position;
+pub mod repository;
 pub mod risk_engine;
 pub mod trade;

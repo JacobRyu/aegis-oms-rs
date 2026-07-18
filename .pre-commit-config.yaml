@@ -59,3 +59,10 @@ repos:
         language: rust
         files: \.rs$
         pass_filenames: false
+      - id: git-cliff
+        name: git cliff changelog
+        description: Generate CHANGELOG.md from conventional commits
+        entry: bash -c 'git cliff --unreleased -o CHANGELOG.md && git add CHANGELOG.md'
+        language: rust
+        files: \.rs$
+        pass_filenames: false

@@ -1,3 +1,5 @@
+use crate::domain::error::Result;
+use crate::domain::repository::TradeRepository;
 use crate::domain::trade::Trade;
 
 pub struct InMemoryTradeStore {
@@ -30,11 +32,25 @@ impl Default for InMemoryTradeStore {
     }
 }
 
+impl TradeRepository for InMemoryTradeStore {
+    fn save(&mut self, trade: Trade) -> Result<()> {
+        self.trades.push(trade);
+        Ok(())
+    }
+
+    fn all(&self) -> Vec<&Trade> {
+        self.trades.iter().rev().collect()
+    }
+
+    fn by_instrument(&self, symbol: &str) -> Vec<&Trade> {
+        self.trades.iter().rev().filter(|t| t.instrument == symbol).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::order::{OrderId, Side};
-    use crate::domain::trade::Trade;
     use rust_decimal_macros::dec;
 
     #[test]
