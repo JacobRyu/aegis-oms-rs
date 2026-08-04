@@ -226,4 +226,8 @@ impl OrderRepository for PgOrderRepository {
     fn all_orders(&self) -> Vec<&Order> {
         self.cache.values().collect()
     }
+
+    fn load_all_owned(&self) -> Result<Vec<Order>> {
+        self.load_all_orders()
+    }
 }

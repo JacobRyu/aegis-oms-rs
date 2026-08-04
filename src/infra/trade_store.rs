@@ -45,6 +45,10 @@ impl TradeRepository for InMemoryTradeStore {
     fn by_instrument(&self, symbol: &str) -> Vec<&Trade> {
         self.trades.iter().rev().filter(|t| t.instrument == symbol).collect()
     }
+
+    fn load_all_owned(&self) -> Result<Vec<Trade>> {
+        Ok(self.trades.clone())
+    }
 }
 
 #[cfg(test)]

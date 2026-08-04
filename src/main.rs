@@ -50,12 +50,12 @@ fn create_pg_service(db_url: &str) -> aegis_oms::service::order_service::OrderSe
     let store = Box::new(aegis_oms::infra::pg_order_repo::PgOrderRepository::new(pool.clone()));
     let trade_store =
         Box::new(aegis_oms::infra::pg_trade_repo::PgTradeRepository::new(pool.clone()));
+    let mut account_repo =
+        aegis_oms::infra::pg_account_repo::PgAccountRepository::new(pool.clone());
 
-    let account = aegis_oms::domain::account::Account::new(
-        "acc-001",
-        "Default",
-        rust_decimal_macros::dec!(100000),
-    );
+    let cfg = aegis_oms::config::AppConfig::load();
+    let account =
+        aegis_oms::domain::account::Account::new("acc-001", "Default", cfg.account.initial_balance);
     let instruments = cli::default_instruments();
     let risk = aegis_oms::service::risk_check::RiskChecker::new(
         aegis_oms::service::risk_check::RiskLimits::default(),
@@ -71,21 +71,33 @@ fn create_pg_service(db_url: &str) -> aegis_oms::service::order_service::OrderSe
         trade_store,
     );
 
-    // P3-4: セッション間状態の復元
-    let account_balance = rt.block_on(async {
-        sqlx::query_scalar::<_, rust_decimal::Decimal>(
-            "SELECT balance FROM accounts WHERE id = 'acc-001'",
+    // P3-4: restore session state from database
+    let positions: Vec<(String, aegis_oms::domain::order::Side, rust_decimal::Decimal, rust_decimal::Decimal)> = rt.block_on(async {
+        #[derive(sqlx::FromRow)]
+        struct PosRow {
+            instrument: String,
+            side: String,
+            quantity: rust_decimal::Decimal,
+            avg_price: rust_decimal::Decimal,
+        }
+        let rows: Vec<PosRow> = sqlx::query_as(
+            "SELECT instrument, side, quantity, avg_price FROM positions WHERE account_id = 'acc-001' AND quantity > 0"
         )
-        .fetch_optional(&pool)
+        .fetch_all(&pool)
         .await
-        .ok()
-        .flatten()
+        .unwrap_or_default();
+        rows.into_iter().filter_map(|r| {
+            let side = match r.side.as_str() {
+                "buy" => Some(aegis_oms::domain::order::Side::Buy),
+                "sell" => Some(aegis_oms::domain::order::Side::Sell),
+                _ => None,
+            }?;
+            Some((r.instrument, side, r.quantity, r.avg_price))
+        }).collect()
     });
 
-    if let Some(balance) = account_balance {
-        let acc = svc.get_account_mut();
-        acc.balance = balance;
-        tracing::info!(%balance, "Restored account balance from database");
+    if let Err(e) = svc.restore_from_db(&mut account_repo, "acc-001", positions) {
+        tracing::warn!(error = %e, "Failed to restore session state from database");
     }
 
     tracing::info!("PostgreSQL persistence enabled");

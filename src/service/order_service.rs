@@ -365,6 +365,48 @@ impl OrderService {
     pub fn get_instruments(&self) -> &HashMap<String, Instrument> {
         &self.instruments
     }
+
+    /// Restore service state from database repositories at startup.
+    /// Loads account, orders, trades and recalculates cumulative realized loss.
+    pub fn restore_from_db(
+        &mut self,
+        account_repo: &mut dyn crate::domain::repository::AccountRepository,
+        account_id: &str,
+        positions: Vec<(String, Side, Decimal, Decimal)>,
+    ) -> Result<()> {
+        if let Some(account) = account_repo.load(account_id)? {
+            self.account = account;
+            tracing::info!(account_id = %account_id, "Restored account from database");
+        }
+        let orders = self.store.load_all_owned()?;
+        for order in &orders {
+            self.store.save(order.clone())?;
+        }
+        tracing::info!(count = orders.len(), "Restored orders from database");
+        let trades = self.trade_store.load_all_owned()?;
+        self.cumulative_realized_loss = trades
+            .iter()
+            .filter_map(|t| t.realized_pnl.filter(|p| *p < Decimal::ZERO))
+            .fold(Decimal::ZERO, |acc, pnl| acc + pnl);
+        tracing::info!(
+            count = trades.len(),
+            cumulative_loss = %self.cumulative_realized_loss,
+            "Restored trades from database"
+        );
+        for (symbol, side, quantity, avg_price) in &positions {
+            self.positions.insert(
+                symbol.clone(),
+                crate::domain::position::Position::new(
+                    symbol.clone(),
+                    *side,
+                    *quantity,
+                    *avg_price,
+                ),
+            );
+        }
+        tracing::info!(count = positions.len(), "Restored positions from database");
+        Ok(())
+    }
 }
 
 #[cfg(test)]

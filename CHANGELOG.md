@@ -15,6 +15,7 @@ All notable changes to this project will be documented in this file. See [conven
 - Phase 1 — advanced orders, risk engine, composite orders, alerts - ([60b864c](https://github.com/jacobryu/aegis-oms-rs/commit/60b864c2e197740e734e1092c7496fa06f30d19b)) - jacob
 - split main.rs CLI into dedicated module, add deposit/withdraw API - ([9e3816a](https://github.com/jacobryu/aegis-oms-rs/commit/9e3816adbf39c4e8498ee5492b3bd05b8a2ad65b)) - jacob
 - implement IOC/FOK execution policy, position/loss limit checks - ([7e69b44](https://github.com/jacobryu/aegis-oms-rs/commit/7e69b448107b7ec524496732493f692b0fcf4d4d)) - jacob
+- implement DB persistence layer with sqlx/PostgreSQL - ([6987323](https://github.com/jacobryu/aegis-oms-rs/commit/6987323b982cfabafb6028cd63a3179f4b767d61)) - jacob
 
 ### Other
 

@@ -88,4 +88,8 @@ impl TradeRepository for PgTradeRepository {
         );
         Vec::new()
     }
+
+    fn load_all_owned(&self) -> Result<Vec<Trade>> {
+        self.load_all()
+    }
 }

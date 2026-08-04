@@ -1,0 +1,13 @@
+[account]
+initial_balance = 100000
+
+[risk]
+max_order_quantity = 1000000
+max_open_orders = 100
+max_open_positions = 20
+stop_out_ratio = 50
+margin_call_ratio = 100
+
+[smtp]
+host = ""
+port = 587

@@ -44,9 +44,17 @@ pub fn default_instruments() -> Vec<Instrument> {
 }
 
 pub fn create_service() -> OrderService {
-    let account = Account::new("acc-001", "Default", dec!(100000));
+    let cfg = aegis_oms::config::AppConfig::load();
+    let account = Account::new("acc-001", "Default", cfg.account.initial_balance);
     let instruments = default_instruments();
-    let risk = RiskChecker::new(RiskLimits::default());
+    let risk = RiskChecker::new(RiskLimits {
+        max_order_quantity: cfg.risk.max_order_quantity,
+        max_open_orders: cfg.risk.max_open_orders,
+        max_open_positions: cfg.risk.max_open_positions,
+        stop_out_ratio: cfg.risk.stop_out_ratio,
+        margin_call_ratio: cfg.risk.margin_call_ratio,
+        max_loss: cfg.risk.max_loss,
+    });
     let bus = EventBus::new();
     OrderService::new(account, instruments, risk, bus)
 }

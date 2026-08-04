@@ -47,6 +47,10 @@ impl OrderRepository for InMemoryOrderStore {
     fn all_orders(&self) -> Vec<&Order> {
         self.orders.values().collect()
     }
+
+    fn load_all_owned(&self) -> Result<Vec<Order>> {
+        Ok(self.orders.values().cloned().collect())
+    }
 }
 
 #[cfg(test)]
